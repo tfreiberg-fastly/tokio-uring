@@ -1,3 +1,6 @@
+use futures_util::future::try_join;
+use nix::{fcntl::OFlag, unistd::pipe2};
+
 use crate::buf::fixed::FixedBuf;
 use crate::buf::{BoundedBuf, BoundedBufMut, IoBuf, IoBufMut, Slice};
 use crate::fs::OpenOptions;
@@ -5,10 +8,10 @@ use crate::io::SharedFd;
 
 use crate::runtime::driver::op::Op;
 use crate::{UnsubmittedOneshot, UnsubmittedWrite};
-use std::fmt;
-use std::io;
+use std::io::{self, ErrorKind};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::path::Path;
+use std::{fmt, mem::ManuallyDrop};
 
 /// A reference to an open file on the filesystem.
 ///
@@ -180,6 +183,70 @@ impl File {
         // Submit the read operation
         let op = Op::read_at(&self.fd, buf, pos).unwrap();
         op.await
+    }
+
+    /// Splice exactly `len` bytes to the given fd, starting at `offset`.
+    /// `out` can refer to files or sockets, tokio-uring opens a pipe and runs two splices concurrently.
+    /// If `offset` is -1, splice starts at the file offset, which is incremented by the number of bytes read.
+    /// The same applies for `offset_out`.
+    /// To emulate sendfile, splice to a socket and set `offset_out` to -1.
+    /// This potentially performs many splice calls until `len` bytes are read.
+    pub async fn splice_exact(
+        &self,
+        offset: i64,
+        out: RawFd,
+        offset_out: i64,
+        len: u32,
+    ) -> io::Result<u32> {
+        let (pipe_read, pipe_write) = pipe2(OFlag::O_CLOEXEC)?;
+
+        // don't close `out`
+        let out_fd = ManuallyDrop::new(SharedFd::new(out));
+
+        let pipe_write_fd = SharedFd::new(pipe_write);
+        let pipe_read_fd = SharedFd::new(pipe_read);
+
+        async fn splice_loop(
+            fd_in: &SharedFd,
+            off_in: i64,
+            fd_out: &SharedFd,
+            off_out: i64,
+            len: u32,
+        ) -> std::io::Result<u32> {
+            let mut bytes_spliced_total = 0;
+            while bytes_spliced_total < len {
+                let next_off = |base_off| {
+                    if base_off == -1 {
+                        -1
+                    } else {
+                        base_off + i64::from(bytes_spliced_total)
+                    }
+                };
+                let off_in = next_off(off_in);
+                let off_out = next_off(off_out);
+                let spliced =
+                    match Op::splice(fd_in, off_in, fd_out, off_out, len - bytes_spliced_total)
+                        .unwrap()
+                        .await
+                    {
+                        Ok(it) => it,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                        Err(e) => {
+                            return Err(e);
+                        }
+                    };
+                bytes_spliced_total += spliced;
+            }
+            assert_eq!(bytes_spliced_total, len);
+            Ok(bytes_spliced_total)
+        }
+
+        let splice_1 = splice_loop(&self.fd, offset, &pipe_write_fd, -1, len);
+        let splice_2 = splice_loop(&pipe_read_fd, -1, &out_fd, offset_out, len);
+        let (result_1, result_2) = try_join(splice_1, splice_2).await?;
+
+        assert_eq!(result_1, result_2);
+        Ok(result_1)
     }
 
     /// Read some bytes at the specified offset from the file into the specified
